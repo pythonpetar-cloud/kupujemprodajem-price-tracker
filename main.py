@@ -3,6 +3,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as ec
 from dotenv import load_dotenv
+from urllib.parse import quote_plus
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -14,22 +15,55 @@ load_dotenv()
 GMAIL_USER = os.getenv("GMAIL_KORISNIK")
 GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
 GMAIL_RECIPIENT = os.getenv("GMAIL_PRIMALAC")
-MAX_PRICE_EUR = float(os.getenv("MAX_CENA_EUR", "400"))
 
 
-def send_email(listings: list[dict]):
-    subject = f"🎯 KP: Found {len(listings)} listing(s) below {MAX_PRICE_EUR:.0f}€"
+def get_search_params() -> tuple[str, float, str]:
+    """Ask the user what to search for, the price threshold, and who to email."""
+    search_term = input("What item are you looking for? (e.g. 'Tamron 28-75 f2.8'): ").strip()
+    while not search_term:
+        search_term = input("Please enter a search term: ").strip()
+
+    while True:
+        raw_price = input("Alert me when price is below (EUR): ").strip().replace(",", ".")
+        try:
+            max_price = float(raw_price)
+            if max_price > 0:
+                break
+            print("Please enter a positive number.")
+        except ValueError:
+            print("Please enter a valid number, e.g. 400 or 399.99")
+
+    default_recipient = GMAIL_RECIPIENT
+    prompt = (
+        f"Send alerts to which email? [{default_recipient}]: "
+        if default_recipient else
+        "Send alerts to which email?: "
+    )
+    while True:
+        recipient = input(prompt).strip()
+        if not recipient and default_recipient:
+            recipient = default_recipient
+        if "@" in recipient and "." in recipient.split("@")[-1]:
+            break
+        print("Please enter a valid email address.")
+
+    return search_term, max_price, recipient
+
+
+def send_email(listings: list[dict], affordable_count: int, search_term: str, max_price: float, recipient: str):
+    subject = f"🎯 KP: {affordable_count} listing(s) below {max_price:.0f}€ — {len(listings)} total"
 
     lines = []
     for listing in listings:
-        lines.append(f"• {listing['title']}")
+        marker = "✅ BELOW LIMIT! " if listing["below_limit"] else ""
+        lines.append(f"• {marker}{listing['title']}")
         lines.append(f"  Price: {listing['price_text']}")
         lines.append(f"  Link: {listing['link']}")
         lines.append("")
 
     body = f"""Hey!
 
-I found {len(listings)} listing(s) for Tamron 28-75 f2.8 below {MAX_PRICE_EUR:.0f}€:
+Found {len(listings)} listings for {search_term} ({affordable_count} below {max_price:.0f}€):
 
 {"\n".join(lines)}
 -- KP Tracker
@@ -37,15 +71,15 @@ I found {len(listings)} listing(s) for Tamron 28-75 f2.8 below {MAX_PRICE_EUR:.0
 
     message = MIMEMultipart()
     message["From"] = GMAIL_USER
-    message["To"] = GMAIL_RECIPIENT
+    message["To"] = recipient
     message["Subject"] = subject
     message.attach(MIMEText(body, "plain", "utf-8"))
 
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
         server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
-        server.sendmail(GMAIL_USER, GMAIL_RECIPIENT, message.as_string())
+        server.sendmail(GMAIL_USER, recipient, message.as_string())
 
-    print(f"✅ Email sent to {GMAIL_RECIPIENT}")
+    print(f"✅ Email sent to {recipient}")
 
 
 class KupujemProdajemBot:
@@ -57,6 +91,7 @@ class KupujemProdajemBot:
         chrome_options.add_argument("--no-sandbox")
         chrome_options.add_argument("--disable-dev-shm-usage")
         chrome_options.add_argument("--disable-gpu")
+        chrome_options.add_argument("--window-size=1920,1080")
         self.driver = webdriver.Chrome(options=chrome_options)
         self.wait = WebDriverWait(self.driver, 35)
 
@@ -79,49 +114,69 @@ class KupujemProdajemBot:
 
         return None
 
-    def get_tamron(self):
-        self.driver.get("https://www.kupujemprodajem.com/pretraga?keywords=tamron+28-75+f2.8")
-        self.wait.until(ec.presence_of_element_located((By.CSS_SELECTOR, "article")))
 
-        listings = self.driver.find_elements(By.CSS_SELECTOR, "article")
-        affordable = []
+def get_listings(self, search_term: str, max_price: float, recipient: str):
+    query = quote_plus(search_term)
+    self.driver.get(f"https://www.kupujemprodajem.com/pretraga?keywords={query}")
+    self.wait.until(ec.presence_of_element_located((By.CSS_SELECTOR, "article")))
 
-        for listing in listings:
-            try:
-                title = listing.find_element(By.CSS_SELECTOR, "a[href*='/oglas/']").text.strip()
-                price_el = listing.find_element(By.XPATH, ".//div[contains(@class,'price')]//div")
-                price_text = price_el.text.strip()
-                link = listing.find_element(By.CSS_SELECTOR, "a[href*='/oglas/']").get_attribute("href")
+    # Scroll to load all lazy-loaded listings
+    last_height = self.driver.execute_script("return document.body.scrollHeight")
+    while True:
+        self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+        time.sleep(1.5)
+        new_height = self.driver.execute_script("return document.body.scrollHeight")
+        if new_height == last_height:
+            break
+        last_height = new_height
 
-                parsed = self.parse_price(price_text)
-                if parsed is None:
-                    print(f"  ⚠️  Could not parse price: '{price_text}' — skipping")
-                    continue
+    listings = self.driver.find_elements(By.CSS_SELECTOR, "article")
+    all_listings = []
 
-                price_in_eur, currency = parsed
-                converted = f" ({price_in_eur:.0f}€)" if currency == "RSD" else ""
-                print(f"{title} | {price_text}{converted} | {link}")
+    for listing in listings:
+        try:
+            title = listing.find_element(By.CSS_SELECTOR, "a[href*='/oglas/']").text.strip()
+            price_el = listing.find_element(By.XPATH, ".//div[contains(@class,'price')]//div")
+            price_text = price_el.text.strip()
+            link = listing.find_element(By.CSS_SELECTOR, "a[href*='/oglas/']").get_attribute("href")
 
-                if price_in_eur <= MAX_PRICE_EUR:
-                    affordable.append({
-                        "title": title,
-                        "price_text": price_text,
-                        "price_number": price_in_eur,
-                        "link": link,
-                    })
-
-            except Exception as e:
-                print(f"  ⚠️  Skipping listing: {e}")
+            parsed = self.parse_price(price_text)
+            if parsed is None:
+                print(f"  ⚠️  Could not parse price: '{price_text}' — skipping")
                 continue
 
-        print(f"\nTotal listings: {len(listings)} | Below {MAX_PRICE_EUR:.0f}€: {len(affordable)}")
+            price_in_eur, currency = parsed
+            converted = f" ({price_in_eur:.0f}€)" if currency == "RSD" else ""
+            below = price_in_eur <= max_price
+            print(f"{'✅' if below else '  '} {title} | {price_text}{converted} | {link}")
 
-        if affordable:
-            send_email(affordable)
-        else:
-            print("No listings below the limit — email not sent.")
+            all_listings.append({
+                "title": title,
+                "price_text": f"{price_text}{converted}",
+                "price_number": price_in_eur,
+                "link": link,
+                "below_limit": below,
+            })
+
+        except Exception as e:
+            print(f"  ⚠️  Skipping listing: {e}")
+            continue
+
+    affordable_count = sum(1 for l in all_listings if l["below_limit"])
+    print(f"\nTotal listings: {len(all_listings)} | Below {max_price:.0f}€: {affordable_count}")
+
+    if all_listings:
+        send_email(all_listings, affordable_count, search_term, max_price, recipient)
+    else:
+        print("No listings found — email not sent.")
 
 
-bot = KupujemProdajemBot()
-bot.get_tamron()
-bot.driver.quit()
+if __name__ == "__main__":
+    term, price, recipient = get_search_params()
+    print(f"\nSearching for '{term}', alerting on listings below {price:.0f}€, sending to {recipient}...\n")
+
+    bot = KupujemProdajemBot()
+    try:
+        bot.get_listings(term, price, recipient)
+    finally:
+        bot.driver.quit()
