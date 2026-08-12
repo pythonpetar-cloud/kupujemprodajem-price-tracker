@@ -114,61 +114,60 @@ class KupujemProdajemBot:
 
         return None
 
+    def get_listings(self, search_term: str, max_price: float, recipient: str):
+        query = quote_plus(search_term)
+        self.driver.get(f"https://www.kupujemprodajem.com/pretraga?keywords={query}")
+        self.wait.until(ec.presence_of_element_located((By.CSS_SELECTOR, "article")))
 
-def get_listings(self, search_term: str, max_price: float, recipient: str):
-    query = quote_plus(search_term)
-    self.driver.get(f"https://www.kupujemprodajem.com/pretraga?keywords={query}")
-    self.wait.until(ec.presence_of_element_located((By.CSS_SELECTOR, "article")))
+        # Scroll to load all lazy-loaded listings
+        last_height = self.driver.execute_script("return document.body.scrollHeight")
+        while True:
+            self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            time.sleep(1.5)
+            new_height = self.driver.execute_script("return document.body.scrollHeight")
+            if new_height == last_height:
+                break
+            last_height = new_height
 
-    # Scroll to load all lazy-loaded listings
-    last_height = self.driver.execute_script("return document.body.scrollHeight")
-    while True:
-        self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        time.sleep(1.5)
-        new_height = self.driver.execute_script("return document.body.scrollHeight")
-        if new_height == last_height:
-            break
-        last_height = new_height
+        listings = self.driver.find_elements(By.CSS_SELECTOR, "article")
+        all_listings = []
 
-    listings = self.driver.find_elements(By.CSS_SELECTOR, "article")
-    all_listings = []
+        for listing in listings:
+            try:
+                title = listing.find_element(By.CSS_SELECTOR, "a[href*='/oglas/']").text.strip()
+                price_el = listing.find_element(By.XPATH, ".//div[contains(@class,'price')]//div")
+                price_text = price_el.text.strip()
+                link = listing.find_element(By.CSS_SELECTOR, "a[href*='/oglas/']").get_attribute("href")
 
-    for listing in listings:
-        try:
-            title = listing.find_element(By.CSS_SELECTOR, "a[href*='/oglas/']").text.strip()
-            price_el = listing.find_element(By.XPATH, ".//div[contains(@class,'price')]//div")
-            price_text = price_el.text.strip()
-            link = listing.find_element(By.CSS_SELECTOR, "a[href*='/oglas/']").get_attribute("href")
+                parsed = self.parse_price(price_text)
+                if parsed is None:
+                    print(f"  ⚠️  Could not parse price: '{price_text}' — skipping")
+                    continue
 
-            parsed = self.parse_price(price_text)
-            if parsed is None:
-                print(f"  ⚠️  Could not parse price: '{price_text}' — skipping")
+                price_in_eur, currency = parsed
+                converted = f" ({price_in_eur:.0f}€)" if currency == "RSD" else ""
+                below = price_in_eur <= max_price
+                print(f"{'✅' if below else '  '} {title} | {price_text}{converted} | {link}")
+
+                all_listings.append({
+                    "title": title,
+                    "price_text": f"{price_text}{converted}",
+                    "price_number": price_in_eur,
+                    "link": link,
+                    "below_limit": below,
+                })
+
+            except Exception as e:
+                print(f"  ⚠️  Skipping listing: {e}")
                 continue
 
-            price_in_eur, currency = parsed
-            converted = f" ({price_in_eur:.0f}€)" if currency == "RSD" else ""
-            below = price_in_eur <= max_price
-            print(f"{'✅' if below else '  '} {title} | {price_text}{converted} | {link}")
+        affordable_count = sum(1 for l in all_listings if l["below_limit"])
+        print(f"\nTotal listings: {len(all_listings)} | Below {max_price:.0f}€: {affordable_count}")
 
-            all_listings.append({
-                "title": title,
-                "price_text": f"{price_text}{converted}",
-                "price_number": price_in_eur,
-                "link": link,
-                "below_limit": below,
-            })
-
-        except Exception as e:
-            print(f"  ⚠️  Skipping listing: {e}")
-            continue
-
-    affordable_count = sum(1 for l in all_listings if l["below_limit"])
-    print(f"\nTotal listings: {len(all_listings)} | Below {max_price:.0f}€: {affordable_count}")
-
-    if all_listings:
-        send_email(all_listings, affordable_count, search_term, max_price, recipient)
-    else:
-        print("No listings found — email not sent.")
+        if all_listings:
+            send_email(all_listings, affordable_count, search_term, max_price, recipient)
+        else:
+            print("No listings found — email not sent.")
 
 
 if __name__ == "__main__":
